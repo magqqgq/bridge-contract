@@ -230,9 +230,25 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
         bytes32 digest =
             keccak256(abi.encode(ROTATE_TAG, block.chainid, address(this), newKeyEpoch, newSigner));
         if (ECDSA.recover(digest, outgoingSig) != currentSigner) revert BadSigner();
+        // SECURITY: a vetoed proposal must stay dead. `rotateSigner` is permissionless
+        // relay of a signature that stays valid for as long as `keyEpoch` has not moved
+        // past `newKeyEpoch`, and the line below deliberately clears `rotationVetoed`.
+        // Together those meant a veto only cancelled the *current* challenge window:
+        // anyone could immediately resubmit the identical `outgoingSig` and open a fresh
+        // window on the very proposal governance had just rejected. The admin was then
+        // forced to win an unbounded series of races — and only had to lose one window,
+        // once, for the rejected signer to become the mint authority. Freezing was
+        // supposed to be terminal; it was merely a delay.
+        //
+        // Recording the vetoed digest makes rejection permanent for that exact
+        // (chain, contract, epoch, signer) tuple. Legitimate rotation is unaffected: the
+        // committee can still hand off by signing a different epoch or signer, and the
+        // admin retains `breakGlassSetSigner`.
+        if (vetoedRotationDigests[digest]) revert RotationIsVetoed();
 
         pendingSigner = newSigner;
         pendingKeyEpoch = newKeyEpoch;
+        pendingRotationDigest = digest;
         pendingActivateAt = block.timestamp + rotateTimelock;
         rotationVetoed = false; // a fresh valid proposal clears any prior veto
         emit RotationProposed(newSigner, newKeyEpoch, pendingActivateAt);
@@ -252,6 +268,7 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
         delete pendingSigner;
         delete pendingKeyEpoch;
         delete pendingActivateAt;
+        delete pendingRotationDigest;
     }
 
     /// @notice Veto a pending rotation (freeze trigger). In production this is driven by
@@ -261,6 +278,9 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     function vetoRotation() external onlyAdmin {
         if (pendingActivateAt == 0) revert NoPendingRotation();
         rotationVetoed = true;
+        // SECURITY: also blacklist the proposal's digest, so replaying the outgoing
+        // signer's signature cannot resurrect it (see `rotateSigner`).
+        vetoedRotationDigests[pendingRotationDigest] = true;
         emit RotationVetoed(pendingSigner, pendingKeyEpoch);
     }
 
@@ -283,6 +303,7 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
         delete pendingSigner;
         delete pendingKeyEpoch;
         delete pendingActivateAt;
+        delete pendingRotationDigest;
         rotationVetoed = false;
         emit Rotated(newSigner, newKeyEpoch);
         emit BreakGlassSignerSet(newSigner, newKeyEpoch);
@@ -337,10 +358,46 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
         admin = newAdmin;
     }
 
+    /// @dev Single hook for every balance change — transfer, transferFrom, mint and burn.
+    ///
+    ///      SECURITY: `whenNotPaused` was previously applied only to `mint` and
+    ///      `redeemToNative`, leaving plain `transfer`/`transferFrom` fully live while the
+    ///      contract was paused. Pause is this bridge's break-glass — the contract's own
+    ///      documentation describes the admin's role as being able to "stop the bleeding"
+    ///      — but the bleeding in a bridge compromise is precisely the movement of
+    ///      fraudulently minted wBDX to an exchange or a mixer. Blocking further mints
+    ///      while leaving the existing supply freely transferable stopped the tap and left
+    ///      the drain open, so the pause could not achieve the containment it was there
+    ///      for. Gating `_update` makes the pause cover all token activity, which is what
+    ///      the admin/signer separation assumes.
+    function _update(address from, address to, uint256 value) internal override whenNotPaused {
+        super._update(from, to, value);
+    }
+
     /// @dev UUPS upgrade authority: admin (a TimelockController) only.
     function _authorizeUpgrade(address) internal override onlyAdmin { }
 
+    // =================================================================================
+    // Rotation-veto durability state (appended — see the storage note below)
+    // =================================================================================
+    /// @notice Digest of the currently pending rotation proposal, retained so a veto can
+    ///         name the exact proposal it rejected.
+    bytes32 public pendingRotationDigest;
+
+    /// @notice Rotation digests that governance has vetoed. A vetoed proposal can never
+    ///         be re-proposed, even by replaying the outgoing signer's original signature.
+    mapping(bytes32 => bool) public vetoedRotationDigests;
+
     /// @dev Storage gap for future upgrades (this contract's own vars only; OZ v5 bases
     ///      use ERC-7201 namespaced storage and need no gap).
-    uint256[40] private __gap;
+    ///
+    ///      SECURITY / UPGRADE SAFETY: `pendingRotationDigest` and
+    ///      `vetoedRotationDigests` are declared immediately above this gap, and the gap
+    ///      was narrowed from 40 to 38 slots to pay for them. They are appended at the
+    ///      end rather than grouped with the other rotation variables on purpose:
+    ///      inserting a slot in the middle of the declaration list would shift every
+    ///      following variable's slot, so an already-deployed proxy would read `admin`,
+    ///      the caps, and the replay map out of the wrong slots. Total reserved-storage
+    ///      budget is unchanged.
+    uint256[38] private __gap;
 }

@@ -404,6 +404,34 @@ contract WrappedBDXTest is Test {
         assertEq(w.currentSigner(), committee); // unchanged
     }
 
+    /// Regression: a veto must be terminal for that proposal. `rotateSigner` is a
+    /// permissionless relay of a signature that stays valid while `keyEpoch` has not moved
+    /// past `newKeyEpoch`, and it clears `rotationVetoed` on each fresh proposal — so
+    /// before the digest blacklist, anyone could resubmit the identical signature to open
+    /// a new challenge window on the proposal governance had just rejected, forcing the
+    /// admin to win an unbounded series of races.
+    function test_Rotation_vetoedCannotBeReproposedByReplayingSignature() public {
+        (, address newSigner) = _newSignerPair();
+        bytes memory rot = _sign(committeePk, _rotateDigest(2, newSigner));
+        w.rotateSigner(newSigner, 2, rot);
+
+        vm.prank(admin);
+        w.vetoRotation();
+
+        // Replaying the very same signature must now revert instead of restarting the
+        // challenge window.
+        vm.expectRevert(WrappedBDX.RotationIsVetoed.selector);
+        w.rotateSigner(newSigner, 2, rot);
+
+        // The committee can still hand off legitimately — a different signer at a later
+        // epoch is a different digest and is not blacklisted.
+        address otherSigner = vm.addr(0x5165B);
+        bytes memory rot3 = _sign(committeePk, _rotateDigest(3, otherSigner));
+        w.rotateSigner(otherSigner, 3, rot3);
+        assertEq(w.pendingSigner(), otherSigner);
+        assertFalse(w.rotationVetoed());
+    }
+
     function test_Rotation_breakGlassWhenNoHandoff() public {
         address bgSigner = vm.addr(0xC0DE);
         vm.prank(admin);
