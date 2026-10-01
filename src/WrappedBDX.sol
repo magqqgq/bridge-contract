@@ -278,9 +278,16 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     function vetoRotation() external onlyAdmin {
         if (pendingActivateAt == 0) revert NoPendingRotation();
         rotationVetoed = true;
-        // SECURITY: also blacklist the proposal's digest, so replaying the outgoing
-        // signer's signature cannot resurrect it (see `rotateSigner`).
-        vetoedRotationDigests[pendingRotationDigest] = true;
+
+        // SECURITY: derive the digest directly from pending fields instead of relying
+        // on `pendingRotationDigest`, which reads bytes32(0) for rotations initiated
+        // before the proxy was upgraded to this implementation.
+        bytes32 digest = keccak256(
+            abi.encode(ROTATE_TAG, block.chainid, address(this), pendingKeyEpoch, pendingSigner)
+        );
+        vetoedRotationDigests[digest] = true;
+        delete pendingRotationDigest;
+
         emit RotationVetoed(pendingSigner, pendingKeyEpoch);
     }
 
