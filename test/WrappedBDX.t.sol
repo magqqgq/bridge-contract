@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import { Test } from "forge-std/Test.sol";
+import { Test, stdStorage, StdStorage } from "forge-std/Test.sol";
 import { WrappedBDX } from "../src/WrappedBDX.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import { PausableUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
 /// A trivial V2 to prove UUPS upgrades are admin-gated (adds one function).
 contract WrappedBDXV2 is WrappedBDX {
@@ -14,10 +15,13 @@ contract WrappedBDXV2 is WrappedBDX {
 }
 
 contract WrappedBDXTest is Test {
+    using stdStorage for StdStorage;
+
     WrappedBDX internal w;
 
     address internal admin = address(0xA11CE);
     address internal alice = address(0xB0B);
+    address internal bob = address(0xCAFE);
     address internal relayer = address(0xF00D);
 
     // Committee Pevm key (a normal secp256k1 key here; in production it is the
@@ -241,7 +245,7 @@ contract WrappedBDXTest is Test {
     }
 
     // =================================================================================
-    // Pause (H.4) — blocks mint but the admin can still rotate signers.
+    // Pause (H.4) — blocks mint, transfers, transferFrom, but rotation still works.
     // =================================================================================
     function test_Pause_blocksMint_butRotationStillWorks() public {
         vm.prank(admin);
@@ -249,7 +253,7 @@ contract WrappedBDXTest is Test {
 
         bytes32 txid = keccak256("dep-paused");
         bytes memory sig = _mintSig(committeePk, alice, 1 * COIN, txid);
-        vm.expectRevert(); // PausableUpgradeable: EnforcedPause
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
         w.mint(alice, 1 * COIN, txid, sig);
 
         // Rotation is not gated by whenNotPaused: a compromised/dead signer must be
@@ -258,6 +262,39 @@ contract WrappedBDXTest is Test {
         bytes memory rot = _sign(committeePk, _rotateDigest(2, newSigner));
         w.rotateSigner(newSigner, 2, rot);
         assertEq(w.pendingSigner(), newSigner);
+    }
+
+    function test_Pause_blocksTransfersAndTransferFrom() public {
+        // Mint funds to alice before pausing
+        bytes32 txid = keccak256("dep-transfer");
+        uint256 amt = 1_000 * COIN;
+        w.mint(alice, amt, txid, _mintSig(committeePk, alice, amt, txid));
+
+        // Alice approves relayer for transferFrom test
+        vm.prank(alice);
+        w.approve(relayer, amt);
+
+        // Pause the bridge
+        vm.prank(admin);
+        w.pause();
+
+        // 1. Plain transfer must revert when paused via _update
+        vm.prank(alice);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        w.transfer(bob, 100 * COIN);
+
+        // 2. transferFrom must revert when paused via _update
+        vm.prank(relayer);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        w.transferFrom(alice, bob, 100 * COIN);
+
+        // Unpause restores transfer capability
+        vm.prank(admin);
+        w.unpause();
+
+        vm.prank(alice);
+        w.transfer(bob, 100 * COIN);
+        assertEq(w.balanceOf(bob), 100 * COIN);
     }
 
     // =================================================================================
@@ -430,6 +467,29 @@ contract WrappedBDXTest is Test {
         w.rotateSigner(otherSigner, 3, rot3);
         assertEq(w.pendingSigner(), otherSigner);
         assertFalse(w.rotationVetoed());
+    }
+
+    /// Regression: verify that in-flight rotation proposals initiated prior to a proxy upgrade
+    /// (where `pendingRotationDigest` is zero) are durably blacklisted when vetoed.
+    function test_Rotation_vetoedPreUpgradeInFlightProposal_cannotBeReplayed() public {
+        (, address newSigner) = _newSignerPair();
+        bytes memory rot = _sign(committeePk, _rotateDigest(2, newSigner));
+        w.rotateSigner(newSigner, 2, rot);
+
+        // Simulate the proxy upgrade condition where an in-flight proposal existed in the
+        // previous implementation: `pendingSigner`, `pendingKeyEpoch`, and `pendingActivateAt`
+        // were set, but the newly introduced storage slot `pendingRotationDigest` reads zero.
+        uint256 slot = stdstore.target(address(w)).sig(w.pendingRotationDigest.selector).find();
+        vm.store(address(w), bytes32(slot), bytes32(0));
+        assertEq(w.pendingRotationDigest(), bytes32(0));
+
+        // Admin vetoes the in-flight proposal
+        vm.prank(admin);
+        w.vetoRotation();
+
+        // Replaying the proposal must still revert because vetoRotation recomputed the digest directly
+        vm.expectRevert(WrappedBDX.RotationIsVetoed.selector);
+        w.rotateSigner(newSigner, 2, rot);
     }
 
     function test_Rotation_breakGlassWhenNoHandoff() public {
